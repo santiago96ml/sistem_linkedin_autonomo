@@ -28,7 +28,9 @@ app.add_middleware(
 )
 
 # Global dictionary to store active login sessions {email: {manager, created_at}}
+import threading
 active_logins = {}
+active_logins_lock = threading.Lock()
 ACTIVE_LOGIN_TTL_MINUTES = 10  # Bug Fix #5: TTL para evitar sessions huérfanas
 
 def _cleanup_expired_logins():
@@ -174,7 +176,9 @@ async def start_login(data: LoginStart, db: Session = Depends(get_db)):
     _cleanup_expired_logins()  # Bug Fix #5: limpiar sessions expiradas
     login_id = data.email
     manager = orchestrator.GuidedLogin(data.email, data.password, data.proxy_url)
-    active_logins[login_id] = {"manager": manager, "created_at": datetime.datetime.utcnow()}
+    # Thread‑safe insertion using lock and initialise attempt counter
+    with active_logins_lock:
+        active_logins[login_id] = {"manager": manager, "created_at": datetime.datetime.utcnow(), "failed_attempts": 0}
 
     try:
         status = await manager.start()
@@ -205,10 +209,18 @@ async def start_login(data: LoginStart, db: Session = Depends(get_db)):
 
 @app.post("/accounts/login/verify")
 async def verify_login(data: LoginVerify, db: Session = Depends(get_db)):
-    login_data = active_logins.get(data.email)
-    if not login_data:
-        raise HTTPException(status_code=404, detail="Login session not found or expired (>10 min)")
-    manager = login_data["manager"]
+    # Clean up any expired sessions before proceeding
+    _cleanup_expired_logins()
+    with active_logins_lock:
+        login_data = active_logins.get(data.email)
+        if not login_data:
+            raise HTTPException(status_code=404, detail="Login session not found or expired (>10 min)")
+        # Enforce a maximum number of 2FA attempts (e.g., 5)
+        if login_data.get("failed_attempts", 0) >= 5:
+            # Invalidate the session to prevent further brute‑force attempts
+            del active_logins[data.email]
+            raise HTTPException(status_code=429, detail="Too many 2FA attempts. Session locked.")
+        manager = login_data["manager"]
 
     storage_state = await manager.submit_code(data.code)
     if storage_state:
@@ -230,9 +242,17 @@ async def verify_login(data: LoginVerify, db: Session = Depends(get_db)):
             db.commit()
             db.refresh(new_acc)
             account_id = new_acc.id
-        del active_logins[data.email]
+        # Successful verification – remove the login session
+        with active_logins_lock:
+            active_logins.pop(data.email, None)
         return {"status": "success", "account_id": account_id}
-    return {"status": "failed", "detail": "2FA code incorrect or expired"}
+    else:
+        # Increment failed attempts counter safely
+        with active_logins_lock:
+            if data.email in active_logins:
+                active_logins[data.email]["failed_attempts"] = active_logins[data.email].get("failed_attempts", 0) + 1
+        return {"status": "failed", "detail": "2FA code incorrect or expired"}
+
 
 @app.get("/missions/", response_model=List[Mission])
 def read_missions(db: Session = Depends(get_db)):
