@@ -1,0 +1,41 @@
+# General
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+*.swp
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+env/
+venv/
+*.egg-info/
+# SQLite DB
+orchestrator.db
+*.sqlite3
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+# OS
+Desktop.ini
+# IDEs
+.idea/
+.vscode/
+# Build artifacts
+build/
+-dist/
+*.egg
+*.whl
+# Coverage
+.coverage
+htmlcov/
+# Test cache
+.pytest_cache/
+# Misc
+.sass-cache
+*.sublime-workspace
+*.sublime-project
