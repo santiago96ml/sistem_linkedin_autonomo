@@ -5,6 +5,7 @@ import json
 import re
 import os
 import time
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -55,50 +56,101 @@ class ModalSentry:
             except Exception:
                 continue
 
+class BrowserManager:
+    """Manages persistent browser contexts for active accounts to allow live interaction."""
+    _instances = {} # {account_id: {browser, context, page}}
+
+    @classmethod
+    async def get_page(cls, account_id, storage_state, proxy_url=None):
+        if account_id in cls._instances:
+            # Check if still healthy
+            try:
+                page = cls._instances[account_id]['page']
+                if not page.is_closed():
+                    return page
+            except Exception:
+                pass
+        
+        # Launch new persistent instance
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(storage_state=storage_state)
+        page = await context.new_page()
+        
+        cls._instances[account_id] = {
+            "pw": pw,
+            "browser": browser,
+            "context": context,
+            "page": page
+        }
+        return page
+
+    @classmethod
+    async def close_all(cls):
+        for data in cls._instances.values():
+            await data['browser'].close()
+            await data['pw'].stop()
+        cls._instances = {}
+
 class MissionRunner:
-    def __init__(self, storage_state: dict, proxy: str = None):
+    def __init__(self, storage_state: dict, proxy: str = None, account_id: int = None):
         self.storage_state = storage_state
         self.proxy = {"server": proxy} if proxy else None
+        self.account_id = account_id
+
+    async def _human_type(self, page, text):
+        """Simula tipeo humano con delays erráticos y pausas."""
+        for char in text:
+            # Velocidad de tipeo humana (entre 50ms y 150ms por tecla)
+            await page.keyboard.type(char, delay=random.randint(50, 150))
+            # 5% de probabilidad de una pausa más larga (simulando pensar o cansancio)
+            if random.random() < 0.05:
+                await asyncio.sleep(random.uniform(0.5, 1.2))
+        logger.info(f"Human-like typing finished for: {text[:20]}...")
 
     async def execute_mission(self, tasks: list):
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                storage_state=self.storage_state,
-                proxy=self.proxy,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
+        if self.account_id:
+            # Use persistent browser
+            page = await BrowserManager.get_page(self.account_id, self.storage_state, self.proxy["server"] if self.proxy else None)
+            return await self._run_on_page(page, tasks)
+        else:
+            # Use temporary browser
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(storage_state=self.storage_state, proxy=self.proxy)
+                page = await context.new_page()
+                return await self._run_on_page(page, tasks)
 
-            results = []
-            for task in tasks:
-                task_type = task.get("type")
-                payload = task.get("payload", {})
-                
-                if task_type == "comment":
-                    res = await self.inject_comment(page, payload.get("url"), payload.get("text"))
-                    results.append({"task": task, "result": res})
-                elif task_type == "reaction":
-                    res = await self.inject_reaction(page, payload.get("url"), payload.get("reaction_type", "LIKE"))
-                    results.append({"task": task, "result": res})
-                else:
-                    results.append({"task": task, "result": f"UNSUPPORTED_TASK_TYPE:{task_type}"})
-                    
-                # Take screenshot to prove execution
+    async def _run_on_page(self, page, tasks):
+        results = []
+        for index, task in enumerate(tasks):
+            task_type = task.get("type")
+            payload = task.get("payload", {})
+            if task_type == "comment":
+                res = await self.inject_comment(page, payload.get("url"), payload.get("text"))
+            elif task_type == "reaction":
+                res = await self.inject_reaction(page, payload.get("url"), payload.get("reaction_type", "LIKE"))
+            elif task_type == "check_notifications":
+                res = await self.check_notifications(page)
+            elif task_type == "smart_comment":
+                res = await self.handle_smart_comment(page, payload.get("url"), payload.get("target_profile_id"))
+            else:
+                res = f"UNSUPPORTED_TASK_TYPE:{task_type}"
+            
+            # Save screenshot for Live View
+            if self.account_id:
                 try:
-                    os.makedirs("screenshots", exist_ok=True)
-                    timestamp = int(time.time())
-                    screenshot_filename = f"proof_{task_type}_{timestamp}.png"
-                    screenshot_path = os.path.join("screenshots", screenshot_filename)
-                    await asyncio.sleep(2)  # Allow UI to settle
-                    await page.screenshot(path=screenshot_path, full_page=True)
-                    logger.info(f"Screenshot taken: {screenshot_path}")
-                    results[-1]["screenshot"] = screenshot_filename
+                    import os
+                    os.makedirs("static/screenshots", exist_ok=True)
+                    screenshot_path = f"static/screenshots/account_{self.account_id}.png"
+                    await page.screenshot(path=screenshot_path)
                 except Exception as e:
-                    logger.error(f"Failed to take screenshot: {e}")
-                    
-            await browser.close()
-            return results
+                    logger.error(f"LiveView Screenshot error: {e}")
+
+            results.append({"task": task, "result": res})
+        return results
 
     async def inject_reaction(self, page, url, reaction_type="LIKE"):
         """Inject a reaction (like) on a LinkedIn post via DOM interaction."""
@@ -240,8 +292,8 @@ class MissionRunner:
                             await page.keyboard.press("Control+A")
                             await page.keyboard.press("Backspace")
                             await asyncio.sleep(0.5)
-                            # Type out the comment
-                            await page.keyboard.type(text, delay=30)
+                            # Type out the comment with human-like behavior
+                            await self._human_type(page, text)
                         except Exception as e:
                             logger.warning(f"Typing error: {e}")
                             
@@ -258,48 +310,108 @@ class MissionRunner:
                 return "COMMENT_EDITOR_NOT_FOUND"
 
             submit_selectors = [
+                "form.comments-comment-box__form button[type='submit']",
                 "button.comments-comment-box__submit-button",
                 "button[data-control-name='comment_submit']",
-                "button.comments-comment-box__submit-button--cr",
-                "form.comments-comment-texteditor button[type='submit']",
-                ".comments-comment-box button.artdeco-button--primary",
-                ".comments-comment-box button:not([aria-label])",
+                ".comments-comment-box__form button:has-text('Comentar')",
+                ".comments-comment-box__form button:has-text('Post')",
+                "button:has-text('Comentar')", # Fallback
+                "button:has-text('Post')", # Fallback
             ]
             submit_success = False
 
+            # Small pause and focus out to ensure state update
+            await page.mouse.click(10, 10) 
+            await asyncio.sleep(1)
+
             # First try Ctrl+Enter to submit
             await page.keyboard.press("Control+Enter")
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
-            # Check if editor is cleared
+            # Check if editor is cleared or disappeared
+            submit_success = False
             try:
-                text_after = await page.locator(comment_editor_selectors[0]).text_content(timeout=1000)
-                if not text_after or len(text_after.strip()) == 0:
-                    submit_success = True
+                # Try to find the editor again
+                editors = page.locator("div[contenteditable='true']")
+                count = await editors.count()
+                if count == 0:
+                    submit_success = True # Editor gone, likely submitted
+                else:
+                    # Check if the visible editor still has text
+                    for i in range(count):
+                        ed = editors.nth(i)
+                        if await ed.is_visible():
+                            val = await ed.inner_text()
+                            if not val.strip():
+                                submit_success = True
+                                break
             except Exception:
-                submit_success = True  # Editor disappeared, likely success
+                pass
 
             if not submit_success:
+                logger.info("Ctrl+Enter failed, trying manual button click...")
                 # If still visible, try clicking submit button
                 for selector in submit_selectors:
                     try:
-                        submit_btn = page.locator(selector).first
-                        if await submit_btn.is_visible(timeout=1500):
-                            await submit_btn.click(force=True, timeout=5000)
-                            await asyncio.sleep(2)
-                            
-                            # Verify again
-                            try:
-                                text_after2 = await page.locator(comment_editor_selectors[0]).text_content(timeout=1000)
-                                if not text_after2 or len(text_after2.strip()) == 0:
-                                    submit_success = True
-                            except Exception:
-                                submit_success = True
+                        locators = page.locator(selector)
+                        count = await locators.count()
+                        for i in range(count):
+                            submit_btn = locators.nth(i)
+                            if await submit_btn.is_visible(timeout=500):
+                                logger.info(f"Attempting hover and click: {selector} (index {i})")
+                                await submit_btn.hover()
+                                await asyncio.sleep(random.uniform(0.3, 0.8))
+                                await submit_btn.click(force=True, timeout=5000)
+                                await asyncio.sleep(4)
                                 
-                            if submit_success:
-                                break
-                    except Exception:
+                                # Double check if still there, try mouse click fallback if needed
+                                editors = page.locator("div[contenteditable='true']")
+                                still_has_text = False
+                                ed_count = await editors.count()
+                                for j in range(ed_count):
+                                    ed = editors.nth(j)
+                                    if await ed.is_visible():
+                                        val = await ed.inner_text()
+                                        if val.strip():
+                                            still_has_text = True
+                                
+                                if still_has_text:
+                                    logger.info("Button click didn't clear editor, trying JS click and Tab sequence...")
+                                    try:
+                                        await page.evaluate(f"document.querySelector('{selector}').click()")
+                                        await asyncio.sleep(2)
+                                    except Exception:
+                                        pass
+                                    
+                                    # Focus again and try Tab-Tab-Enter
+                                    await ed.focus()
+                                    await page.keyboard.press("Tab")
+                                    await asyncio.sleep(0.1)
+                                    await page.keyboard.press("Tab")
+                                    await asyncio.sleep(0.1)
+                                    await page.keyboard.press("Enter")
+                                    await asyncio.sleep(4)
+                                
+                                break # Found and clicked a visible button
+                    except Exception as e:
+                        logger.warning(f"Submission attempt failed for {selector}: {e}")
                         continue
+                
+                # Final verification
+                editors = page.locator("div[contenteditable='true']")
+                count = await editors.count()
+                if count == 0:
+                    submit_success = True
+                else:
+                    all_empty = True
+                    for i in range(count):
+                        ed = editors.nth(i)
+                        if await ed.is_visible():
+                            val = await ed.inner_text()
+                            if val.strip():
+                                all_empty = False
+                    if all_empty:
+                        submit_success = True
 
             await asyncio.sleep(2)
             if not submit_success:
@@ -309,6 +421,104 @@ class MissionRunner:
         except Exception as e:
             logger.error(f"Comment injection error: {e}")
             return str(e)
+
+    async def check_notifications(self, page):
+        """Scrapes the notifications page to identify recent interactions."""
+        try:
+            await page.goto("https://www.linkedin.com/notifications/", wait_until="domcontentloaded")
+            await asyncio.sleep(5)
+            await ModalSentry.dismiss_all(page)
+
+            # Wait for the notifications list to load
+            try:
+                await page.wait_for_selector(".nt-card", timeout=5000)
+            except Exception:
+                logger.warning("No notifications found or page structure changed.")
+                return []
+
+            notifications = await page.evaluate("""() => {
+                const cards = document.querySelectorAll('.nt-card');
+                const results = [];
+                cards.forEach((card, index) => {
+                    if (index > 10) return; // Only top 10
+                    const text = card.innerText || "";
+                    const link = card.querySelector('a')?.href || "";
+                    const time = card.querySelector('.nt-card__time-ago')?.innerText || "";
+                    const isUnread = card.classList.contains('nt-card--unread');
+                    
+                    results.push({
+                        text: text.replace(/\\n/g, ' ').trim(),
+                        link,
+                        time,
+                        unread: isUnread
+                    });
+                });
+                return results;
+            }""")
+            
+            return notifications
+        except Exception as e:
+            logger.error(f"Error checking notifications: {e}")
+            return f"ERROR: {str(e)}"
+
+    async def handle_smart_comment(self, page, post_url, target_id):
+        """Analyzes a post and injects either a CTA keyword or an AI comment."""
+        try:
+            # 1. Visit post and get text
+            await page.goto(post_url, wait_until="domcontentloaded")
+            await asyncio.sleep(5)
+            await ModalSentry.dismiss_all(page)
+
+            # Get post text
+            post_text = await page.evaluate("""() => {
+                const textEl = document.querySelector('.feed-shared-update-v2__description-wrapper, .update-components-text');
+                return textEl ? textEl.innerText : "";
+            }""")
+            
+            if not post_text:
+                logger.warning(f"SmartComment: Could not find text for {post_url}")
+                return "NO_TEXT_FOUND"
+
+            # 2. Check for CTA Keywords
+            from database import SessionLocal
+            import models
+            import re
+            
+            db = SessionLocal()
+            target = db.query(models.TargetProfile).filter(models.TargetProfile.id == target_id).first()
+            db.close()
+            
+            final_comment = None
+            if target and target.cta_keywords:
+                keywords = [k.strip() for k in target.cta_keywords.split(",") if k.strip()]
+                text_lower = post_text.lower()
+                for kw in keywords:
+                    # Look for "comenta [kw]", "escribe [kw]", etc.
+                    patterns = [
+                        f"comenta\\s+{re.escape(kw.lower())}",
+                        f"escribe\\s+{re.escape(kw.lower())}",
+                        f"dime\\s+{re.escape(kw.lower())}",
+                        f"pon\\s+{re.escape(kw.lower())}",
+                        f"keyword\\s*[:\\-]?\\s*{re.escape(kw.lower())}"
+                    ]
+                    if any(re.search(p, text_lower) for p in patterns):
+                        logger.info(f"SmartComment: CTA Keyword '{kw}' detected!")
+                        final_comment = kw
+                        break
+
+            # 3. If no CTA, generate AI comment
+            if not final_comment:
+                logger.info("SmartComment: No specific CTA detected. Generating AI response...")
+                # Here we would call Muapi.ai or Wan2GP
+                # For now, we use the comment_base or a placeholder
+                final_comment = target.comment_base if target else "Excelente contenido."
+                
+            # 4. Inject the comment
+            return await self.inject_comment(page, post_url, final_comment)
+
+        except Exception as e:
+            logger.error(f"SmartComment error: {e}")
+            return f"ERROR: {str(e)}"
 
 
 class GuidedLogin:

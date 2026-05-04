@@ -1,28 +1,55 @@
 import sys
 import asyncio
+import logging
 
+# Configure logging first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- WINDOWS ASYNCIO FIX (CRITICAL FOR PLAYWRIGHT SUBPROCESSES) ---
 if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        from asyncio import WindowsProactorEventLoopPolicy
+        # Set the policy globally
+        asyncio.set_event_loop_policy(WindowsProactorEventLoopPolicy())
+        logger.info("Enforced WindowsProactorEventLoopPolicy at module level")
+    except ImportError:
+        logger.error("Could not import WindowsProactorEventLoopPolicy")
+# ------------------------------------------------
 
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 import models, database, orchestrator
+import os
 from database import engine, get_db, SessionLocal
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 import datetime
 import traceback
+import json
 
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="LinkedIn Orchestrator API")
 
+@app.on_event("startup")
+async def startup_event():
+    loop = asyncio.get_event_loop()
+    logger.info(f"Running with event loop: {type(loop).__name__}")
+    if sys.platform == 'win32' and type(loop).__name__ != 'ProactorEventLoop':
+        logger.warning("WARNING: Not using ProactorEventLoop! Subprocesses (Playwright) will fail.")
+
+# Ensure static dir exists
+os.makedirs("static/screenshots", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Enable CORS for Frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -82,11 +109,41 @@ class LoginVerify(BaseModel):
     email: str
     code: str
 
+class WarmupConfigBase(BaseModel):
+    niche: Optional[str] = None
+    personality: Optional[str] = None
+    languages: Optional[str] = "Spanish, English"
+    forbidden_topics: Optional[str] = None
+    tone_modifiers: Optional[str] = "Professional, Helpful"
+    vip_profiles: Optional[List[str]] = None
+    total_days: Optional[int] = 120
+
+class WarmupConfigUpdate(WarmupConfigBase):
+    account_id: int
+
+class WarmupStatus(BaseModel):
+    account_id: int
+    name: str
+    profile_pic_url: Optional[str]
+    current_day: int
+    total_days: int = 120
+    current_level: int
+    daily_actions: int
+    max_actions: int = 150
+    health_percentage: int
+    is_warming_up: int = 1
+
 # --- BACKGROUND TASKS ---
 async def run_mission_task(mission_id: int):
     """Bug Fix #3: Usa SessionLocal directamente en lugar de un generator corrupto."""
     db = SessionLocal()
     try:
+        # Debug: Verificar el tipo de loop
+        loop = asyncio.get_running_loop()
+        logger.info(f"Running mission {mission_id} on loop: {type(loop)}")
+        if sys.platform == 'win32' and 'ProactorEventLoop' not in str(type(loop)):
+            logger.error("CRITICAL: Subprocesses will fail! ProactorEventLoop not found.")
+
         mission = db.get(models.Mission, mission_id)
         if not mission:
             return
@@ -116,7 +173,26 @@ async def run_mission_task(mission_id: int):
             db.commit()
             return
 
-        runner = orchestrator.MissionRunner(account.storage_state, account.proxy_url)
+        # --- WARM-UP LOGIC: Daily Limits ---
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        if account.last_action_date != today:
+            account.daily_action_count = 0
+            account.last_action_date = today
+            db.commit()
+
+        # Si est en calentamiento, lmite estricto de 10 acciones (likes + comentarios)
+        MAX_WARMUP_ACTIONS = 10
+        if account.is_warming_up and account.daily_action_count >= MAX_WARMUP_ACTIONS:
+            mission.status = "failed"
+            db.add(models.Log(
+                mission_id=mission_id,
+                message=f"BLOQUEO DE SEGURIDAD: La cuenta '{account.email}' est en modo CALENTAMIENTO y ha superado el lmite de {MAX_WARMUP_ACTIONS} acciones diarias.",
+                level="warning"
+            ))
+            db.commit()
+            return
+
+        runner = orchestrator.MissionRunner(account.storage_state, account.proxy_url, account_id=account.id)
 
         try:
             db.add(models.Log(
@@ -133,6 +209,10 @@ async def run_mission_task(mission_id: int):
             for res in results:
                 result_val = res['result']
                 is_success = result_val == 200
+                
+                if is_success:
+                    account.daily_action_count += 1
+                
                 log_msg = f"Task '{res['task']['type']}' → result: {result_val}"
                 db.add(models.Log(
                     mission_id=mission_id,
@@ -170,6 +250,95 @@ def delete_account(account_id: int, db: Session = Depends(get_db)):
     db.delete(account)
     db.commit()
     return {"status": "success", "message": f"Account {account_id} deleted"}
+
+@app.put("/accounts/{account_id}/warmup/toggle")
+def toggle_account_warmup(account_id: int, db: Session = Depends(get_db)):
+    account = db.get(models.Account, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    
+    account.is_warming_up = 0 if account.is_warming_up == 1 else 1
+    db.commit()
+    return {"status": "success", "is_warming_up": account.is_warming_up}
+
+@app.get("/accounts/{account_id}/notifications")
+async def get_notifications(account_id: int, db: Session = Depends(get_db)):
+    account = db.get(models.Account, account_id)
+    if not account or not account.storage_state:
+        raise HTTPException(status_code=404, detail="Account or session not found")
+    
+    runner = orchestrator.MissionRunner(account.storage_state, account.proxy_url, account_id=account.id)
+    # We run it as a one-off mission task
+    results = await runner.execute_mission([{"type": "check_notifications", "payload": {}}])
+    
+    # The result will be in the first item's 'result' field
+    if results and len(results) > 0:
+        return {"account_id": account_id, "notifications": results[0].get("result", [])}
+    return {"account_id": account_id, "notifications": []}
+
+@app.post("/accounts/{account_id}/live")
+async def activate_live_session(account_id: int, db: Session = Depends(get_db)):
+    """Warms up and keeps a browser instance alive for an account."""
+    account = db.get(models.Account, account_id)
+    if not account or not account.storage_state:
+        raise HTTPException(status_code=404, detail="Account or session not found")
+    
+    try:
+        # Trigger get_page to ensure it's running
+        await orchestrator.BrowserManager.get_page(account_id, account.storage_state, account.proxy_url)
+        return {"status": "alive", "account_id": account_id}
+    except Exception as e:
+        logger.error(f"Failed to start live session for account {account_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Browser activation failed: {str(e)}")
+
+from fastapi import WebSocket, WebSocketDisconnect
+import json
+
+@app.websocket("/ws/live/{account_id}")
+async def live_stream(websocket: WebSocket, account_id: int):
+    logger.info(f"WS: Connection attempt for account {account_id}")
+    await websocket.accept()
+    logger.info(f"WS: Connection accepted for account {account_id}")
+    try:
+        while True:
+            # 1. Listen for input commands from frontend
+            try:
+                # Use wait_for to avoid blocking indefinitely
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                cmd = json.loads(data)
+                
+                # Relay command to BrowserManager
+                page = orchestrator.BrowserManager._instances.get(account_id, {}).get("page")
+                if page:
+                    if cmd["type"] == "click":
+                        await page.mouse.click(cmd["x"], cmd["y"])
+                    elif cmd["type"] == "type":
+                        await page.keyboard.type(cmd["text"])
+                    elif cmd["type"] == "press":
+                        await page.keyboard.press(cmd["key"])
+            except asyncio.TimeoutError:
+                pass
+            
+            # 2. Send current screenshot back
+            import base64
+            screenshot_path = f"static/screenshots/account_{account_id}.png"
+            if os.path.exists(screenshot_path):
+                with open(screenshot_path, "rb") as f:
+                    encoded = base64.b64encode(f.read()).decode('utf-8')
+                    await websocket.send_json({"type": "stream", "image": encoded})
+            
+            await asyncio.sleep(0.5) # Stream at ~2fps
+    except WebSocketDisconnect:
+        logger.info(f"Live stream disconnected for account {account_id}")
+    except Exception as e:
+        logger.error(f"WS Error: {e}")
+
+@app.get("/notifications/")
+def list_all_notifications(account_id: Optional[int] = None, db: Session = Depends(get_db)):
+    query = db.query(models.Notification)
+    if account_id:
+        query = query.filter(models.Notification.account_id == account_id)
+    return query.order_by(models.Notification.id.desc()).all()
 
 @app.post("/accounts/login/start")
 async def start_login(data: LoginStart, db: Session = Depends(get_db)):
@@ -475,9 +644,6 @@ import autopilot
 
 @app.on_event("startup")
 async def startup_event():
-    # Fix for Windows asyncio loop policy
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     # Start the autopilot scheduler loop in the background
     asyncio.create_task(autopilot.start_autopilot_scheduler())
 
@@ -530,6 +696,90 @@ def delete_target_profile(target_id: int, db: Session = Depends(get_db)):
     # Delete associated processed posts
     db.query(models.ProcessedPost).filter(models.ProcessedPost.target_profile_id == target_id).delete()
     db.delete(target)
+    db.commit()
+    return {"status": "success"}
+
+# --- WARMUP LAB ENDPOINTS ---
+
+@app.get("/warmup/status", response_model=List[WarmupStatus])
+def get_warmup_status(db: Session = Depends(get_db)):
+    try:
+        # 1. Get accounts that are warming up
+        accounts = db.query(models.Account).filter(models.Account.is_warming_up == 1).all()
+        results = []
+        now = datetime.datetime.utcnow()
+        
+        # 2. Collect accounts that need a config
+        needs_config = []
+        
+        for acc in accounts:
+            try:
+                # Day calculation (handle None)
+                start_date = acc.created_at if acc.created_at else now
+                days_diff = (now - start_date).days + 1
+                
+                config = acc.warmup_config
+                if not config:
+                    # Create default config but don't commit yet to avoid locks
+                    config = models.WarmupConfig(account_id=acc.id)
+                    db.add(config)
+                    needs_config.append(config)
+                
+                daily_actions = acc.daily_action_count if acc.daily_action_count is not None else 0
+                health = int((daily_actions / 150) * 100)
+                
+                # Use a default trust level if config is new/missing
+                trust_level = int(config.current_trust_level) if (config and config.current_trust_level is not None) else 1
+                
+                results.append({
+                    "account_id": int(acc.id),
+                    "name": str(acc.name) if acc.name else f"Account {acc.id}",
+                    "profile_pic_url": acc.profile_pic_url,
+                    "current_day": int(days_diff),
+                    "total_days": int(config.total_days) if config.total_days else 120,
+                    "current_level": trust_level,
+                    "daily_actions": int(daily_actions),
+                    "max_actions": 150,
+                    "health_percentage": int(min(health, 100)),
+                    "is_warming_up": int(acc.is_warming_up)
+                })
+            except Exception as inner_e:
+                print(f"Error processing account {acc.id}: {inner_e}")
+                continue
+        
+        # 3. Single commit at the end if needed
+        if needs_config:
+            db.commit()
+            
+        return results
+    except Exception as e:
+        import traceback
+        print("CRITICAL Error in /warmup/status:")
+        traceback.print_exc()
+        return []
+
+@app.get("/warmup/config/{account_id}", response_model=WarmupConfigBase)
+def get_warmup_config(account_id: int, db: Session = Depends(get_db)):
+    config = db.query(models.WarmupConfig).filter(models.WarmupConfig.account_id == account_id).first()
+    if not config:
+        # Create default
+        config = models.WarmupConfig(account_id=account_id)
+        db.add(config)
+        db.commit()
+        db.refresh(config)
+    return config
+
+@app.post("/warmup/config")
+def update_warmup_config(payload: WarmupConfigUpdate, db: Session = Depends(get_db)):
+    config = db.query(models.WarmupConfig).filter(models.WarmupConfig.account_id == payload.account_id).first()
+    if not config:
+        config = models.WarmupConfig(account_id=payload.account_id)
+        db.add(config)
+    
+    for key, value in payload.dict(exclude={'account_id'}).items():
+        if value is not None:
+            setattr(config, key, value)
+            
     db.commit()
     return {"status": "success"}
 
