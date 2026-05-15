@@ -9,6 +9,37 @@ import random
 
 logger = logging.getLogger(__name__)
 
+class LogStreamer:
+    """Manages WebSocket log streams for missions."""
+    def __init__(self):
+        self._queues = {} # dict[int, list[asyncio.Queue]]
+
+    def subscribe(self, mission_id: int) -> asyncio.Queue:
+        if mission_id not in self._queues:
+            self._queues[mission_id] = []
+        queue = asyncio.Queue()
+        self._queues[mission_id].append(queue)
+        return queue
+
+    def push(self, mission_id: int, log_entry: dict):
+        if mission_id in self._queues:
+            for queue in self._queues[mission_id]:
+                if queue.qsize() < 1000:
+                    try:
+                        queue.put_nowait(log_entry)
+                    except asyncio.QueueFull:
+                        pass
+
+    def unsubscribe(self, mission_id: int, queue: asyncio.Queue = None):
+        if mission_id in self._queues:
+            if queue and queue in self._queues[mission_id]:
+                self._queues[mission_id].remove(queue)
+            else:
+                del self._queues[mission_id]
+            
+            if mission_id in self._queues and not self._queues[mission_id]:
+                del self._queues[mission_id]
+
 class ModalSentry:
     """Detects and dismisses intrusive LinkedIn overlays (modals, popups, message bubbles)."""
     
@@ -93,6 +124,103 @@ class BrowserManager:
             await data['pw'].stop()
         cls._instances = {}
 
+class BrowserInstance:
+    """Represents a managed browser instance in the pool."""
+    def __init__(self, account_id: int, browser, context, page, pw):
+        self.account_id = account_id
+        self.browser = browser
+        self.context = context
+        self.page = page
+        self.pw = pw
+        self.acquired_at = time.time()
+        self.last_used = time.time()
+
+    async def close(self):
+        try:
+            if self.browser:
+                await self.browser.close()
+        except Exception:
+            pass
+        try:
+            if self.pw:
+                await self.pw.stop()
+        except Exception:
+            pass
+
+    @property
+    def is_open(self):
+        try:
+            return self.page is not None and not self.page.is_closed()
+        except Exception:
+            return False
+
+class BrowserPool:
+    """Pool of browser instances with max concurrency limit and TTL-based cleanup."""
+    def __init__(self, max_instances: int = 5, instance_ttl: int = 600):
+        self.max_instances = max_instances
+        self.instance_ttl = instance_ttl
+        self._instances: dict[int, BrowserInstance] = {}
+        self._semaphore = asyncio.Semaphore(max_instances)
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, account_id: int, storage_state: dict, proxy_url: str = None, timeout: float = 30.0) -> BrowserInstance:
+        async with self._lock:
+            instance = self._instances.get(account_id)
+            if instance and instance.is_open:
+                instance.last_used = time.time()
+                return instance
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Browser pool full after {timeout}s wait (max={self.max_instances})")
+        try:
+            pw = await async_playwright().start()
+            proxy_cfg = {"server": proxy_url} if proxy_url else None
+            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = await browser.new_context(storage_state=storage_state, proxy=proxy_cfg, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            page = await context.new_page()
+            instance = BrowserInstance(account_id, browser, context, page, pw)
+            async with self._lock:
+                old = self._instances.get(account_id)
+                if old:
+                    await old.close()
+                self._instances[account_id] = instance
+            return instance
+        except Exception:
+            self._semaphore.release()
+            raise
+
+    async def release(self, account_id: int):
+        async with self._lock:
+            instance = self._instances.pop(account_id, None)
+        if instance:
+            await instance.close()
+            self._semaphore.release()
+
+    async def get_page(self, account_id: int, storage_state: dict, proxy_url: str = None):
+        inst = await self.acquire(account_id, storage_state, proxy_url)
+        return inst.page
+
+    async def _cleanup_stale(self):
+        now = time.time()
+        async with self._lock:
+            stale_ids = [aid for aid, inst in self._instances.items() if (now - inst.last_used) > self.instance_ttl or not inst.is_open]
+            for aid in stale_ids:
+                inst = self._instances.pop(aid)
+                await inst.close()
+                self._semaphore.release()
+
+    def get_metrics(self) -> dict:
+        return {
+            "active_instances": len(self._instances),
+            "max_instances": self.max_instances,
+            "available_slots": self.max_instances - len(self._instances),
+            "ttl_seconds": self.instance_ttl
+        }
+
+browser_pool = BrowserPool(max_instances=5, instance_ttl=600)
+log_streamer = LogStreamer()
+
 class MissionRunner:
     def __init__(self, storage_state: dict, proxy: str = None, account_id: int = None):
         self.storage_state = storage_state
@@ -112,7 +240,7 @@ class MissionRunner:
     async def execute_mission(self, tasks: list):
         if self.account_id:
             # Use persistent browser
-            page = await BrowserManager.get_page(self.account_id, self.storage_state, self.proxy["server"] if self.proxy else None)
+            page = await browser_pool.get_page(self.account_id, self.storage_state, self.proxy["server"] if self.proxy else None)
             return await self._run_on_page(page, tasks)
         else:
             # Use temporary browser
@@ -139,15 +267,7 @@ class MissionRunner:
             else:
                 res = f"UNSUPPORTED_TASK_TYPE:{task_type}"
             
-            # Save screenshot for Live View
-            if self.account_id:
-                try:
-                    import os
-                    os.makedirs("static/screenshots", exist_ok=True)
-                    screenshot_path = f"static/screenshots/account_{self.account_id}.png"
-                    await page.screenshot(path=screenshot_path)
-                except Exception as e:
-                    logger.error(f"LiveView Screenshot error: {e}")
+
 
             results.append({"task": task, "result": res})
         return results
@@ -490,21 +610,12 @@ class MissionRunner:
             
             final_comment = None
             if target and target.cta_keywords:
-                keywords = [k.strip() for k in target.cta_keywords.split(",") if k.strip()]
-                text_lower = post_text.lower()
-                for kw in keywords:
-                    # Look for "comenta [kw]", "escribe [kw]", etc.
-                    patterns = [
-                        f"comenta\\s+{re.escape(kw.lower())}",
-                        f"escribe\\s+{re.escape(kw.lower())}",
-                        f"dime\\s+{re.escape(kw.lower())}",
-                        f"pon\\s+{re.escape(kw.lower())}",
-                        f"keyword\\s*[:\\-]?\\s*{re.escape(kw.lower())}"
-                    ]
-                    if any(re.search(p, text_lower) for p in patterns):
-                        logger.info(f"SmartComment: CTA Keyword '{kw}' detected!")
-                        final_comment = kw
-                        break
+                # Use shared multi-language CTA detection from autopilot
+                from autopilot import _detect_call_to_action
+                detected = _detect_call_to_action(post_text, target.cta_keywords)
+                if detected:
+                    logger.info(f"SmartComment: CTA Keyword '{detected}' detected!")
+                    final_comment = detected
 
             # 3. If no CTA, generate AI comment
             if not final_comment:
@@ -563,9 +674,75 @@ class GuidedLogin:
             self.page = await self.context.new_page()
 
             await self.page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
-            await self.page.fill("#username", self.email)
-            await self.page.fill("#password", self.password)
-            await self.page.click("button[type='submit']")
+
+            # LinkedIn A/B tests between two login page versions:
+            #   Classic: #username and #password exist directly in HTML
+            #   React:   auto-generated IDs like :r0:, autocomplete="username"
+            # We detect and handle both.
+            try:
+                form_found = False
+                for i in range(30):  # Poll up to 15 seconds
+                    has_classic_user = await self.page.evaluate("document.querySelector('#username') !== null")
+                    has_classic_pw = await self.page.evaluate("document.querySelector('#password') !== null")
+
+                    if has_classic_user and has_classic_pw:
+                        form_found = "classic"
+                        break
+
+                    # React version: check for autocomplete fields
+                    has_react_user = await self.page.evaluate(
+                        "document.querySelector('input[autocomplete=\"username\"]') !== null"
+                    )
+                    has_react_pw = await self.page.evaluate(
+                        "document.querySelector('input[autocomplete=\"current-password\"]') !== null"
+                    )
+                    if has_react_user and has_react_pw:
+                        form_found = "react"
+                        break
+
+                    await asyncio.sleep(0.5)
+
+                if not form_found:
+                    raise TimeoutError("LinkedIn login form not found after 15s polling")
+
+                await asyncio.sleep(0.5)
+
+                if form_found == "classic":
+                    await self.page.fill("#username", self.email)
+                    await self.page.fill("#password", self.password)
+                else:
+                    # React version: fields exist but may not pass visibility checks
+                    # (LinkedIn anti-bot hides them with CSS). Use force=True.
+                    email_input = self.page.locator("input[autocomplete='username']").first
+                    await email_input.wait_for(state="attached", timeout=5000)
+                    await email_input.fill(self.email, force=True)
+
+                    pw_input = self.page.locator("input[autocomplete='current-password']").first
+                    await pw_input.wait_for(state="attached", timeout=5000)
+                    await pw_input.fill(self.password, force=True)
+
+                logger.info(f"[GuidedLogin] Credentials filled ({form_found} mode) for {self.email[:8]}...")
+
+            except Exception as e:
+                logger.warning(f"[GuidedLogin] LinkedIn login form not found. Error: {e}")
+                os.makedirs("screenshots", exist_ok=True)
+                await self.page.screenshot(path=f"screenshots/login_failed_{self.email}.png")
+                raise e
+
+            # Click "Sign in" — LinkedIn uses type="button" and all form
+            # elements are hidden by CSS anti-bot. Use JS click to bypass.
+            await self.page.wait_for_selector("button:has-text('Sign in')", state="attached", timeout=5000)
+            await self.page.evaluate("""() => {
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    if (btn.textContent.trim() === 'Sign in') {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            logger.info("[GuidedLogin] Sign in button clicked via JS")
 
             await asyncio.sleep(5)
 
@@ -580,6 +757,27 @@ class GuidedLogin:
 
             # Requiere verificación 2FA / challenge
             if "checkpoint" in current_url or "challenge" in current_url:
+                # Detectar tipo de 2FA y posibles captchas
+                content = await self.page.content()
+                content_lower = content.lower()
+                
+                if "security verification" in content_lower or "verificación de seguridad" in content_lower or "captcha" in content_lower:
+                    await self._cleanup()
+                    return "needs_captcha"
+                
+                if "authenticator app" in content_lower or "aplicación de autenticación" in content_lower:
+                    return "needs_2fa_app"
+                    
+                if "email" in content_lower or "correo" in content_lower:
+                    dest = "unknown_email"
+                    match = re.search(r'([a-zA-Z0-9*._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', content)
+                    if match:
+                        dest = match.group(1)
+                    return f"needs_2fa_email:{dest}"
+                    
+                if "sms" in content_lower or "mensaje de texto" in content_lower:
+                    return "needs_2fa_sms"
+                
                 # NO cerramos — el usuario debe enviar el código
                 return "2fa_required"
 

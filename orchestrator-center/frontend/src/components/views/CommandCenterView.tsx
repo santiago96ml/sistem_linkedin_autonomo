@@ -51,8 +51,8 @@ export const CommandCenterView = () => {
   const connectWebSocket = (accountId: number) => {
     if (wsRef.current) wsRef.current.close();
     
-    // Dynamically derive WS URL from API_URL
-    const baseUrl = API_URL.replace(/^http/, 'ws');
+    // Dynamically derive WS URL from API_URL, ensuring no trailing slashes
+    const baseUrl = API_URL.replace(/^http/, 'ws').replace(/\/$/, '');
     const wsUrl = `${baseUrl}/ws/live/${accountId}`;
     console.log('Connecting to WS:', wsUrl);
     const ws = new WebSocket(wsUrl);
@@ -65,7 +65,7 @@ export const CommandCenterView = () => {
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === 'stream') {
-        setStreamImage(`data:image/png;base64,${data.image}`);
+        setStreamImage(`data:image/jpeg;base64,${data.image}`);
       }
     };
 

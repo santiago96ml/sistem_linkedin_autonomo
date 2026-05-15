@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "active_work_id": "plan-59a75682",
+  "works": {
+    "plan-59a75682": {
+      "work_id": "plan-59a75682",
+      "active_plan": "C:\\Users\\merca\\OneDrive\\Desktop\\preuenba\\.sisyphus\\plans\\plan.md",
+      "plan_name": "plan",
+      "status": "active",
+      "started_at": "2026-05-14T14:08:48.183Z",
+      "updated_at": "2026-05-14T14:08:48.183Z",
+      "session_ids": [
+        "ses_1d9c531b5ffe5dIDpRAVROfUk1"
+      ],
+      "session_origins": {
+        "ses_1d9c531b5ffe5dIDpRAVROfUk1": "direct"
+      },
+      "agent": "sisyphus",
+      "task_sessions": {}
+    }
+  },
+  "active_plan": "C:\\Users\\merca\\OneDrive\\Desktop\\preuenba\\.sisyphus\\plans\\plan.md",
+  "started_at": "2026-05-14T14:08:48.183Z",
+  "status": "active",
+  "updated_at": "2026-05-14T14:08:48.183Z",
+  "session_ids": [
+    "ses_1d9c531b5ffe5dIDpRAVROfUk1"
+  ],
+  "session_origins": {
+    "ses_1d9c531b5ffe5dIDpRAVROfUk1": "direct"
+  },
+  "plan_name": "plan",
+  "task_sessions": {},
+  "agent": "sisyphus"
+}

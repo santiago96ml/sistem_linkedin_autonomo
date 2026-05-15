@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { TerminalSquare, Play, History, CheckCircle2, XCircle, Loader2, MessageSquare, ThumbsUp, Users, User, Sparkles, Type, Clock, ChevronDown, ChevronUp } from 'lucide-react';
 import { Account, Mission, LogEntry } from '../../hooks/useOrchestrator';
+import { ConcurrentTestModal } from '../ConcurrentTestModal';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -101,7 +102,7 @@ export function MissionsView({ accounts, missions, logs = [], onLaunchMission }:
   const canSubmit = !isLaunching && postUrl && (enableLike || enableComment) && (!enableComment || commentText) && getTargetAccountIds().length > 0;
 
   return (
-    <div className="space-y-8 animate-in fade-in slide-in-from-right-4 duration-500">
+    <div suppressHydrationWarning className="space-y-8 animate-in fade-in slide-in-from-right-4 duration-500">
 
       {/* ── New Mission Form ── */}
       <section className="rounded-xl border border-white/5 bg-slate-900/40 p-6 backdrop-blur-sm shadow-xl">
@@ -109,6 +110,10 @@ export function MissionsView({ accounts, missions, logs = [], onLaunchMission }:
           <Play className="text-indigo-500" size={18} />
           Lanzar Nueva Misión
         </h3>
+
+        <div className="flex justify-end mb-4">
+          <ConcurrentTestModal triggerClassName="px-4 py-2 rounded-lg bg-gradient-to-r from-violet-500 to-indigo-600 hover:from-violet-600 hover:to-indigo-700 text-white font-medium text-xs shadow-[0_0_15px_rgba(99,102,241,0.3)] hover:shadow-[0_0_25px_rgba(99,102,241,0.5)] transition-all" />
+        </div>
 
         <form onSubmit={handleSubmit} className="space-y-6">
 
@@ -347,6 +352,7 @@ export function MissionsView({ accounts, missions, logs = [], onLaunchMission }:
               <tr>
                 <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-slate-500">ID</th>
                 <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-slate-500">Agente</th>
+                <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-slate-500">Origen</th>
                 <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-slate-500">Tareas</th>
                 <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-slate-500">Estado</th>
                 <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-widest text-slate-500">Fecha</th>
@@ -367,6 +373,9 @@ export function MissionsView({ accounts, missions, logs = [], onLaunchMission }:
                           {accounts.find(a => a.id === m.account_id)?.name || 'Unknown'}
                         </span>
                       </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <SourceBadge source={m.source} />
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex gap-1.5">
@@ -397,7 +406,7 @@ export function MissionsView({ accounts, missions, logs = [], onLaunchMission }:
                   </tr>
                   {expandedMission === m.id && (
                     <tr>
-                      <td colSpan={6} className="px-6 py-4 bg-slate-950/50 border-t border-white/5">
+                      <td colSpan={7} className="px-6 py-4 bg-slate-950/50 border-t border-white/5">
                         <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar">
                           <div className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2">Logs del Sistema (últimos)</div>
                           {logs.length > 0 ? logs.map((log) => (
@@ -426,7 +435,7 @@ export function MissionsView({ accounts, missions, logs = [], onLaunchMission }:
                 </React.Fragment>
               )) : (
                 <tr>
-                  <td colSpan={6} className="px-6 py-12 text-center text-slate-500 text-sm italic">
+                  <td colSpan={7} className="px-6 py-12 text-center text-slate-500 text-sm italic">
                     No se han registrado misiones aún.
                   </td>
                 </tr>
@@ -440,6 +449,23 @@ export function MissionsView({ accounts, missions, logs = [], onLaunchMission }:
 }
 
 
+
+function SourceBadge({ source }: { source?: string }) {
+  const configs: any = {
+    manual: { label: 'Manual', color: 'text-slate-400 bg-slate-500/10 border-slate-500/20', icon: '👤' },
+    autopilot: { label: 'AutoPilot', color: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/20', icon: '🤖' },
+    autopilot_notification: { label: 'Notificación', color: 'text-violet-400 bg-violet-500/10 border-violet-500/20', icon: '🔔' },
+    concurrent_test: { label: 'Test', color: 'text-amber-400 bg-amber-500/10 border-amber-500/20', icon: '🧪' },
+  };
+  const key = (source || 'manual') as keyof typeof configs;
+  const config = configs[key] || configs.manual;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-bold uppercase tracking-wider ${config.color}`}>
+      <span className="text-[11px]">{config.icon}</span>
+      {config.label}
+    </span>
+  );
+}
 
 function StatusBadge({ status }: { status: string }) {
   const configs: any = {

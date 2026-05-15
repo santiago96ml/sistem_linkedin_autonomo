@@ -9,4 +9,4 @@ if __name__ == "__main__":
         print("WindowsProactorEventLoopPolicy forced in run_server.py")
     
     # Run WITHOUT reload to ensure loop stability on some Windows environments
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False, loop="asyncio")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, loop="asyncio")

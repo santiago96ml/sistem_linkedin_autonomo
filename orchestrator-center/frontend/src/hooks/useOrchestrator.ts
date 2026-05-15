@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+const API_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '');
 
 export interface Account {
   id: number;
@@ -15,6 +15,8 @@ export interface Mission {
   id: number;
   account_id: number;
   status: string;
+  source?: string;
+  target_profile_id?: number;
   created_at: string;
   tasks: any[];
 }
@@ -44,11 +46,24 @@ export interface TargetProfile {
   comment_base?: string;
 }
 
+export interface AutoPilotStatus {
+  status: string;            // "starting" | "running" | "cooldown" | "error"
+  failures: number;
+  cooldown_remaining: number;
+  last_autopilot_cycle: string | null;
+  last_notifications_cycle: string | null;
+  last_error: string | null;
+  started_at: string | null;
+  targets_active: number;
+  total_cycles_run: number;
+}
+
 export function useOrchestrator() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [targets, setTargets] = useState<TargetProfile[]>([]);
+  const [autopilotStatus, setAutopilotStatus] = useState<AutoPilotStatus | null>(null);
   const [stats, setStats] = useState<Stats>({
     total_identities: 0,
     active_missions: 0,
@@ -58,12 +73,13 @@ export function useOrchestrator() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [accRes, missRes, logRes, statsRes, targetsRes] = await Promise.allSettled([
+      const [accRes, missRes, logRes, statsRes, targetsRes, apStatusRes] = await Promise.allSettled([
         fetch(`${API_URL}/accounts/`),
         fetch(`${API_URL}/missions/`),
         fetch(`${API_URL}/logs/`),
         fetch(`${API_URL}/stats`),
-        fetch(`${API_URL}/autopilot/targets`)
+        fetch(`${API_URL}/autopilot/targets`),
+        fetch(`${API_URL}/autopilot/status`)
       ]);
 
       const safeJson = async (res: PromiseSettledResult<Response>) => {
@@ -73,18 +89,20 @@ export function useOrchestrator() {
         return null;
       };
 
-      const [accData, missData, logData, statsData, targetsData] = await Promise.all([
+      const [accData, missData, logData, statsData, targetsData, apStatusData] = await Promise.all([
         safeJson(accRes),
         safeJson(missRes),
         safeJson(logRes),
         safeJson(statsRes),
         safeJson(targetsRes),
+        safeJson(apStatusRes),
       ]);
 
       if (accData) setAccounts(accData);
       if (missData) setMissions(missData);
       if (statsData) setStats(statsData);
       if (targetsData) setTargets(targetsData);
+      if (apStatusData) setAutopilotStatus(apStatusData);
 
       if (logData) {
         // Map backend logs to frontend format
@@ -156,6 +174,7 @@ export function useOrchestrator() {
     logs,
     stats,
     targets,
+    autopilotStatus,
     refresh: fetchData,
     deleteAccount,
     addTargetProfile,

@@ -1,15 +1,50 @@
 import React, { useState } from 'react';
-import { Target, Plus, Play, Pause, Trash2, Clock, Key, AlignLeft, ShieldCheck, Zap } from 'lucide-react';
-import { TargetProfile } from '../../hooks/useOrchestrator';
+import { Target, Plus, Play, Pause, Trash2, Clock, Key, AlignLeft, ShieldCheck, Zap, Activity, AlertTriangle, CheckCircle, RefreshCw } from 'lucide-react';
+import { TargetProfile, AutoPilotStatus } from '../../hooks/useOrchestrator';
 
 interface AutoPilotViewProps {
   targets: TargetProfile[];
+  status: AutoPilotStatus | null;
   onAddTarget: (data: Omit<TargetProfile, 'id' | 'status'>) => Promise<void>;
   onToggleTarget: (id: number) => Promise<void>;
   onDeleteTarget: (id: number) => Promise<void>;
 }
 
-export function AutoPilotView({ targets, onAddTarget, onToggleTarget, onDeleteTarget }: AutoPilotViewProps) {
+function StatusIcon({ s }: { s: string }) {
+  const icons: any = {
+    running: <Activity className="animate-pulse" size={16} />,
+    starting: <RefreshCw className="animate-spin" size={16} />,
+    cooldown: <AlertTriangle size={16} />,
+    error: <AlertTriangle size={16} />,
+  };
+  return icons[s] || <Activity size={16} />;
+}
+
+function StatusColors(s: string) {
+  const m: any = {
+    running: { bg: 'bg-emerald-500/10', border: 'border-emerald-500/20', text: 'text-emerald-400', dot: 'bg-emerald-400' },
+    starting: { bg: 'bg-blue-500/10', border: 'border-blue-500/20', text: 'text-blue-400', dot: 'bg-blue-400' },
+    cooldown: { bg: 'bg-amber-500/10', border: 'border-amber-500/20', text: 'text-amber-400', dot: 'bg-amber-400' },
+    error: { bg: 'bg-rose-500/10', border: 'border-rose-500/20', text: 'text-rose-400', dot: 'bg-rose-400' },
+  };
+  return m[s] || m.starting;
+}
+
+const fmt = (iso: string | null) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString();
+};
+
+const timeAgo = (iso: string | null) => {
+  if (!iso) return 'nunca';
+  const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (diff < 60)  return `${diff}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}min`;
+  return `${Math.floor(diff / 3600)}h`;
+};
+
+export function AutoPilotView({ targets, status, onAddTarget, onToggleTarget, onDeleteTarget }: AutoPilotViewProps) {
   const [url, setUrl] = useState('');
   const [start, setStart] = useState('09:00');
   const [end, setEnd] = useState('18:00');
@@ -33,7 +68,56 @@ export function AutoPilotView({ targets, onAddTarget, onToggleTarget, onDeleteTa
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-right-4 duration-500">
-      
+
+      {/* ── Scheduler Status Panel ── */}
+      {status && (() => {
+        const c = StatusColors(status.status);
+        return (
+          <div className={`rounded-xl border ${c.border} ${c.bg} p-5 backdrop-blur-sm shadow-lg`}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-bold uppercase tracking-wider flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${c.dot} ${status.status === 'running' ? 'animate-pulse' : ''}`}></span>
+                <span className={c.text}>Scheduler <StatusIcon s={status.status} /></span>
+                <span className={`ml-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase border ${c.border} ${c.text}`}>
+                  {status.status}
+                </span>
+              </h3>
+              <span className="text-[10px] text-slate-500 font-mono">
+                {status.total_cycles_run} ciclos · activo desde {fmt(status.started_at)}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+              <div>
+                <p className="text-[10px] font-bold uppercase text-slate-500 mb-0.5">Último ciclo</p>
+                <p className="text-slate-200">{timeAgo(status.last_autopilot_cycle)}</p>
+                <p className="text-[10px] text-slate-500">{fmt(status.last_autopilot_cycle)}</p>
+              </div>
+              <div>
+                <p className="text-[10px] font-bold uppercase text-slate-500 mb-0.5">Últ. notificaciones</p>
+                <p className="text-slate-200">{timeAgo(status.last_notifications_cycle)}</p>
+                <p className="text-[10px] text-slate-500">{fmt(status.last_notifications_cycle)}</p>
+              </div>
+              <div>
+                <p className="text-[10px] font-bold uppercase text-slate-500 mb-0.5">Fallos consecutivos</p>
+                <p className={status.failures >= 3 ? 'text-rose-400 font-bold' : 'text-slate-200'}>
+                  {status.failures} / 3
+                  {status.status === 'cooldown' && <span className="text-amber-400 ml-1">(cooldown ~{status.cooldown_remaining}min)</span>}
+                </p>
+              </div>
+              <div>
+                <p className="text-[10px] font-bold uppercase text-slate-500 mb-0.5">Targets activos</p>
+                <p className="text-slate-200">{status.targets_active}</p>
+              </div>
+            </div>
+            {status.last_error && (
+              <div className="mt-3 p-2 rounded-lg bg-rose-500/10 border border-rose-500/20 text-[11px] text-rose-300">
+                ⚠ Último error: {status.last_error}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Informational Header */}
       <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 p-6 shadow-lg relative overflow-hidden">
         <div className="absolute -right-10 -top-10 text-blue-500/10">

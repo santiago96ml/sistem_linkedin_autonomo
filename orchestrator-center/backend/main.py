@@ -1,6 +1,7 @@
 import sys
 import asyncio
 import logging
+import base64
 
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
@@ -17,14 +18,25 @@ if sys.platform == 'win32':
         logger.error("Could not import WindowsProactorEventLoopPolicy")
 # ------------------------------------------------
 
+def _simple_encrypt(text: str) -> str:
+    key = 0x5A
+    encoded = ''.join(chr(ord(c) ^ key) for c in text)
+    return base64.b64encode(encoded.encode()).decode()
+
+def _simple_decrypt(encrypted: str) -> str:
+    key = 0x5A
+    decoded = base64.b64decode(encrypted.encode()).decode()
+    return ''.join(chr(ord(c) ^ key) for c in decoded)
+
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-import models, database, orchestrator
+import models, database, orchestrator, cookie_importer, proxy_pool
 import os
+import uuid
 from database import engine, get_db, SessionLocal
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
 import datetime
 import traceback
@@ -41,9 +53,10 @@ async def startup_event():
     if sys.platform == 'win32' and type(loop).__name__ != 'ProactorEventLoop':
         logger.warning("WARNING: Not using ProactorEventLoop! Subprocesses (Playwright) will fail.")
 
-# Ensure static dir exists
-os.makedirs("static/screenshots", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+    # Start the autopilot scheduler loop in the background
+    import autopilot
+    asyncio.create_task(autopilot.start_autopilot_scheduler())
+    logger.info("AutoPilot scheduler task created.")
 
 # Enable CORS for Frontend
 app.add_middleware(
@@ -90,6 +103,8 @@ class MissionBase(BaseModel):
 class Mission(MissionBase):
     id: int
     status: str
+    source: str = "manual"
+    target_profile_id: Optional[int] = None
     created_at: datetime.datetime
     model_config = ConfigDict(from_attributes=True)
 
@@ -133,10 +148,136 @@ class WarmupStatus(BaseModel):
     health_percentage: int
     is_warming_up: int = 1
 
+class ConcurrentTestRequest(BaseModel):
+    account_ids: List[int]
+    task_template: dict
+    concurrency_level: int
+
+
+def _safe_increment_action_count(account_id: int, db) -> bool:
+    """Atomically increment action count using with_for_update."""
+    from models import Account
+    try:
+        account = db.query(Account).with_for_update().filter(Account.id == account_id).first()
+        if not account:
+            return False
+
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        if account.last_action_date != today:
+            account.daily_action_count = 0
+            account.last_action_date = today
+
+        MAX_WARMUP_ACTIONS = 10
+        if account.is_warming_up and account.daily_action_count >= MAX_WARMUP_ACTIONS:
+            return False
+
+        account.daily_action_count += 1
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"_safe_increment_action_count error: {e}")
+        db.rollback()
+        return False
+
+
+def _acquire_execution_lock(account_id: int, mission_id: int, db) -> bool:
+    """Acquire a lock for an account. Returns False if already locked."""
+    from models import ExecutionLock
+    try:
+        existing = db.query(ExecutionLock).filter(
+            ExecutionLock.account_id == account_id
+        ).with_for_update().first()
+        if existing:
+            if existing.acquired_at:
+                elapsed = (datetime.datetime.utcnow() - existing.acquired_at).total_seconds()
+                if elapsed > existing.ttl_seconds:
+                    db.delete(existing)
+                    db.commit()
+                else:
+                    return False
+            else:
+                return False
+
+        lock = ExecutionLock(
+            account_id=account_id,
+            mission_id=mission_id,
+            acquired_at=datetime.datetime.utcnow(),
+            ttl_seconds=600
+        )
+        db.add(lock)
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"_acquire_execution_lock error: {e}")
+        db.rollback()
+        return False
+
+
+def _release_execution_lock(account_id: int, db):
+    """Release the lock for an account."""
+    from models import ExecutionLock
+    try:
+        lock = db.query(ExecutionLock).filter(
+            ExecutionLock.account_id == account_id
+        ).first()
+        if lock:
+            db.delete(lock)
+            db.commit()
+    except Exception as e:
+        logger.error(f"_release_execution_lock error: {e}")
+        db.rollback()
+
+
+def check_rate_limit(account_id: int, action_type: str, db) -> bool:
+    """Check if account is within rate limit. Returns True if OK, False if blocked."""
+    from models import RateLimit, Account
+    try:
+        now = datetime.datetime.utcnow()
+        window_start = now - datetime.timedelta(hours=1)
+
+        record = db.query(RateLimit).filter(
+            RateLimit.account_id == account_id,
+            RateLimit.action_type == action_type
+        ).with_for_update().first()
+
+        if not record:
+            record = RateLimit(account_id=account_id, action_type=action_type, action_count=1, window_start=now)
+            db.add(record)
+            db.commit()
+            return True
+
+        if record.window_start < window_start:
+            record.action_count = 1
+            record.window_start = now
+            db.commit()
+            return True
+
+        account = db.query(Account).filter(Account.id == account_id).first()
+        limit = 10 if (account and account.is_warming_up) else 50
+
+        if record.action_count >= limit:
+            return False
+
+        record.action_count += 1
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"check_rate_limit error: {e}")
+        db.rollback()
+        return True
+
+
 # --- BACKGROUND TASKS ---
 async def run_mission_task(mission_id: int):
     """Bug Fix #3: Usa SessionLocal directamente en lugar de un generator corrupto."""
     db = SessionLocal()
+    queue = log_streamer.subscribe(mission_id)
+    
+    def push_log(level: str, message: str):
+        entry = {"timestamp": datetime.datetime.utcnow().isoformat(), "level": level, "message": message}
+        log_streamer.push(mission_id, entry)
+        db.add(models.Log(mission_id=mission_id, message=message, level=level))
+    
     try:
         # Debug: Verificar el tipo de loop
         loop = asyncio.get_running_loop()
@@ -155,21 +296,13 @@ async def run_mission_task(mission_id: int):
         # Bug Fix #1: Validar que la cuenta existe y tiene sesión activa
         if not account:
             mission.status = "failed"
-            db.add(models.Log(
-                mission_id=mission_id,
-                message=f"Error: Account ID {mission.account_id} not found in database. Mission is orphaned.",
-                level="error"
-            ))
+            push_log("error", f"Error: Account ID {mission.account_id} not found in database. Mission is orphaned.")
             db.commit()
             return
 
         if not account.storage_state:
             mission.status = "failed"
-            db.add(models.Log(
-                mission_id=mission_id,
-                message=f"Error: Account '{account.email}' has no active session. Please log in first.",
-                level="error"
-            ))
+            push_log("error", f"Error: Account '{account.email}' has no active session. Please log in first.")
             db.commit()
             return
 
@@ -180,25 +313,34 @@ async def run_mission_task(mission_id: int):
             account.last_action_date = today
             db.commit()
 
-        # Si est en calentamiento, lmite estricto de 10 acciones (likes + comentarios)
+        # Si está en calentamiento, límite estricto de 10 acciones
         MAX_WARMUP_ACTIONS = 10
         if account.is_warming_up and account.daily_action_count >= MAX_WARMUP_ACTIONS:
             mission.status = "failed"
-            db.add(models.Log(
-                mission_id=mission_id,
-                message=f"BLOQUEO DE SEGURIDAD: La cuenta '{account.email}' est en modo CALENTAMIENTO y ha superado el lmite de {MAX_WARMUP_ACTIONS} acciones diarias.",
-                level="warning"
-            ))
+            push_log("warning", f"BLOQUEO DE SEGURIDAD: La cuenta '{account.email}' está en modo CALENTAMIENTO y ha superado el límite de {MAX_WARMUP_ACTIONS} acciones diarias.")
             db.commit()
+            return
+
+        # --- ACQUIRE EXECUTION LOCK ---
+        if not _acquire_execution_lock(account.id, mission_id, db):
+            push_log("warning", f"Account '{account.email}' is busy with another mission. Queuing.")
+            mission.status = "queued"
+            db.commit()
+            return
+
+        # --- CHECK RATE LIMIT ---
+        first_task_type = mission.tasks[0].get("type", "unknown") if mission.tasks else "unknown"
+        if not check_rate_limit(account.id, first_task_type, db):
+            push_log("warning", f"Rate limit exceeded for account '{account.email}'. Queuing.")
+            mission.status = "queued"
+            db.commit()
+            _release_execution_lock(account.id, db)
             return
 
         runner = orchestrator.MissionRunner(account.storage_state, account.proxy_url, account_id=account.id)
 
         try:
-            db.add(models.Log(
-                mission_id=mission_id,
-                message=f"Starting mission with {len(mission.tasks)} tasks for account '{account.email}'."
-            ))
+            push_log("info", f"Starting mission with {len(mission.tasks)} tasks for account '{account.email}'.")
             db.commit()
 
             results = await runner.execute_mission(mission.tasks)
@@ -214,25 +356,19 @@ async def run_mission_task(mission_id: int):
                     account.daily_action_count += 1
                 
                 log_msg = f"Task '{res['task']['type']}' → result: {result_val}"
-                db.add(models.Log(
-                    mission_id=mission_id,
-                    message=log_msg,
-                    level="success" if is_success else "warning"
-                ))
+                push_log("success" if is_success else "warning", log_msg)
 
         except Exception as e:
             # Bug Fix #2: Captura traceback completo, no solo str(e)
             tb = traceback.format_exc()
             mission.status = "failed"
-            db.add(models.Log(
-                mission_id=mission_id,
-                message=f"Mission error: {type(e).__name__}: {str(e) or 'no message'}\n{tb[:1000]}",
-                level="error"
-            ))
+            push_log("error", f"Mission error: {type(e).__name__}: {str(e) or 'no message'}\n{tb[:1000]}")
 
         db.commit()
     finally:
-        db.close()  # Siempre liberar la sesión
+        _release_execution_lock(account.id, db)
+        log_streamer.unsubscribe(mission_id, queue)
+        db.close()
 
 # --- ENDPOINTS ---
 
@@ -276,6 +412,7 @@ async def get_notifications(account_id: int, db: Session = Depends(get_db)):
         return {"account_id": account_id, "notifications": results[0].get("result", [])}
     return {"account_id": account_id, "notifications": []}
 
+
 @app.post("/accounts/{account_id}/live")
 async def activate_live_session(account_id: int, db: Session = Depends(get_db)):
     """Warms up and keeps a browser instance alive for an account."""
@@ -291,47 +428,99 @@ async def activate_live_session(account_id: int, db: Session = Depends(get_db)):
         logger.error(f"Failed to start live session for account {account_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Browser activation failed: {str(e)}")
 
-from fastapi import WebSocket, WebSocketDisconnect
-import json
-
 @app.websocket("/ws/live/{account_id}")
 async def live_stream(websocket: WebSocket, account_id: int):
-    logger.info(f"WS: Connection attempt for account {account_id}")
-    await websocket.accept()
-    logger.info(f"WS: Connection accepted for account {account_id}")
+    logger.info(f"WS Attempt: Account {account_id} from {websocket.client}")
     try:
-        while True:
-            # 1. Listen for input commands from frontend
+        await websocket.accept()
+        logger.info(f"WS Accepted: Account {account_id}")
+    except Exception as e:
+        logger.error(f"WS Accept Failed for account {account_id}: {e}")
+        return
+    
+    # 1. Get browser instance (with retry to handle slow startup)
+    instance = None
+    for _ in range(10): # Try for 5 seconds
+        instance = orchestrator.BrowserManager._instances.get(account_id)
+        if instance and instance.get("page"):
+            break
+        await asyncio.sleep(0.5)
+        
+    if not instance:
+        logger.error(f"WS FAIL: No instance found in BrowserManager._instances for account {account_id} after timeout")
+        await websocket.close(code=1008)
+        return
+        
+    page = instance.get("page")
+    if not page or page.is_closed():
+        logger.error(f"WS FAIL: Page is closed or missing for account {account_id}")
+        await websocket.close(code=1008)
+        return
+
+    try:
+        # Create CDP session
+        logger.info(f"WS: Creating CDP session for account {account_id}")
+        # Ensure page is ready for CDP
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except:
+            pass
+        cdp = await page.context.new_cdp_session(page)
+        
+        async def on_frame(event):
             try:
-                # Use wait_for to avoid blocking indefinitely
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                await websocket.send_json({
+                    "type": "stream",
+                    "image": event["data"]
+                })
+                await cdp.send("Page.screencastFrameAck", {"sessionId": event["sessionId"]})
+            except Exception as e:
+                logger.debug(f"Screencast send error: {e}")
+
+        cdp.on("Page.screencastFrame", lambda event: asyncio.create_task(on_frame(event)))
+        
+        await cdp.send("Page.startScreencast", {
+            "format": "jpeg",
+            "quality": 60,
+            "maxWidth": 1280,
+            "maxHeight": 720,
+            "everyNthFrame": 1
+        })
+        logger.info(f"WS: Screencast STARTED for account {account_id}")
+
+        while True:
+            try:
+                data = await websocket.receive_text()
                 cmd = json.loads(data)
                 
-                # Relay command to BrowserManager
-                page = orchestrator.BrowserManager._instances.get(account_id, {}).get("page")
-                if page:
-                    if cmd["type"] == "click":
-                        await page.mouse.click(cmd["x"], cmd["y"])
-                    elif cmd["type"] == "type":
-                        await page.keyboard.type(cmd["text"])
-                    elif cmd["type"] == "press":
-                        await page.keyboard.press(cmd["key"])
+                if cmd["type"] == "click":
+                    await page.mouse.click(cmd["x"], cmd["y"])
+                elif cmd["type"] == "type":
+                    await page.keyboard.type(cmd["text"])
+                elif cmd["type"] == "press":
+                    await page.keyboard.press(cmd["key"])
             except asyncio.TimeoutError:
-                pass
-            
-            # 2. Send current screenshot back
-            import base64
-            screenshot_path = f"static/screenshots/account_{account_id}.png"
-            if os.path.exists(screenshot_path):
-                with open(screenshot_path, "rb") as f:
-                    encoded = base64.b64encode(f.read()).decode('utf-8')
-                    await websocket.send_json({"type": "stream", "image": encoded})
-            
-            await asyncio.sleep(0.5) # Stream at ~2fps
+                continue
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.debug(f"Input relay error: {e}")
+                
     except WebSocketDisconnect:
-        logger.info(f"Live stream disconnected for account {account_id}")
+        logger.info(f"WS: Disconnected for account {account_id}")
     except Exception as e:
-        logger.error(f"WS Error: {e}")
+        logger.error(f"WS CRITICAL Error for account {account_id}: {e}")
+    finally:
+        logger.info(f"WS CLEANUP for account {account_id}")
+        try:
+            await cdp.send("Page.stopScreencast")
+        except:
+            pass
+        if websocket.client_state.name != "DISCONNECTED":
+            try:
+                await websocket.close()
+            except:
+                pass
 
 @app.get("/notifications/")
 def list_all_notifications(account_id: Optional[int] = None, db: Session = Depends(get_db)):
@@ -423,6 +612,257 @@ async def verify_login(data: LoginVerify, db: Session = Depends(get_db)):
         return {"status": "failed", "detail": "2FA code incorrect or expired"}
 
 
+# ══════════════════════════════════════════════════════════════════════
+# PROXY POOL
+# ══════════════════════════════════════════════════════════════════════
+
+class ProxyCreate(BaseModel):
+    name: Optional[str] = None
+    host: str
+    port: int
+    username: Optional[str] = None
+    password: Optional[str] = None
+    protocol: str = "socks5"
+    country: Optional[str] = None
+    city: Optional[str] = None
+
+class ProxyUpdate(BaseModel):
+    name: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    protocol: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class ProxyResponse(BaseModel):
+    id: int
+    name: Optional[str] = None
+    host: str
+    port: int
+    protocol: str
+    country: Optional[str] = None
+    city: Optional[str] = None
+    is_active: bool
+    is_online: bool
+    last_health_check: Optional[datetime.datetime] = None
+    assigned_account_id: Optional[int] = None
+    created_at: Optional[datetime.datetime] = None
+    model_config = ConfigDict(from_attributes=True)
+
+class ProxyAssignRequest(BaseModel):
+    account_id: int
+
+class ProxyAutoAssignRequest(BaseModel):
+    account_id: int
+    country: Optional[str] = None
+
+
+@app.get("/proxies/", response_model=List[ProxyResponse])
+def list_proxies(active_only: bool = True, db: Session = Depends(get_db)):
+    return proxy_pool.ProxyPool.get_all(db, active_only)
+
+@app.post("/proxies/", response_model=ProxyResponse)
+def create_proxy(payload: ProxyCreate, db: Session = Depends(get_db)):
+    p = proxy_pool.Proxy(
+        name=payload.name,
+        host=payload.host,
+        port=payload.port,
+        username=payload.username,
+        password=payload.password,
+        protocol=payload.protocol,
+        country=payload.country.upper() if payload.country else None,
+        city=payload.city,
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    logger.info(f"Proxy creado: {p.short_url} ({p.country})")
+    return p
+
+@app.put("/proxies/{proxy_id}", response_model=ProxyResponse)
+def update_proxy(proxy_id: int, payload: ProxyUpdate, db: Session = Depends(get_db)):
+    p = db.get(proxy_pool.Proxy, proxy_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+    update_data = payload.model_dump(exclude_unset=True)
+    for k, v in update_data.items():
+        if k == "country" and v:
+            v = v.upper()
+        setattr(p, k, v)
+    db.commit()
+    db.refresh(p)
+    return p
+
+@app.delete("/proxies/{proxy_id}")
+def delete_proxy(proxy_id: int, db: Session = Depends(get_db)):
+    p = db.get(proxy_pool.Proxy, proxy_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+    # Liberar cuenta si estaba asignada
+    if p.assigned_account_id:
+        acc = db.get(models.Account, p.assigned_account_id)
+        if acc:
+            acc.proxy_url = None
+    db.delete(p)
+    db.commit()
+    return {"status": "success", "message": f"Proxy {proxy_id} eliminado"}
+
+@app.post("/proxies/{proxy_id}/assign")
+def assign_proxy(proxy_id: int, payload: ProxyAssignRequest, db: Session = Depends(get_db)):
+    try:
+        p = proxy_pool.ProxyPool.assign_to_account(db, proxy_id, payload.account_id)
+        return {"status": "success", "proxy_id": p.id, "account_id": payload.account_id,
+                "proxy_url": p.short_url}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.post("/proxies/auto-assign")
+def auto_assign_proxy(payload: ProxyAutoAssignRequest, db: Session = Depends(get_db)):
+    p = proxy_pool.ProxyPool.auto_assign(db, payload.account_id, payload.country)
+    if not p:
+        available = proxy_pool.ProxyPool.get_available(db)
+        if available:
+            # Asignar cualquiera disponible
+            p = proxy_pool.ProxyPool.assign_to_account(db, available[0].id, payload.account_id)
+        else:
+            raise HTTPException(status_code=404, detail="No hay proxies disponibles")
+    return {"status": "success", "proxy_id": p.id, "proxy_url": p.short_url,
+            "country": p.country}
+
+@app.post("/proxies/{proxy_id}/unassign")
+def unassign_proxy(proxy_id: int, db: Session = Depends(get_db)):
+    p = db.get(proxy_pool.Proxy, proxy_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+    if p.assigned_account_id:
+        acc = db.get(models.Account, p.assigned_account_id)
+        if acc:
+            acc.proxy_url = None
+        p.assigned_account_id = None
+        db.commit()
+    return {"status": "success", "message": f"Proxy {proxy_id} desasignado"}
+
+@app.post("/proxies/health-check")
+async def run_proxy_health_check(db: Session = Depends(get_db)):
+    results = await proxy_pool.ProxyPool.run_health_checks(db)
+    return results
+
+@app.get("/proxies/stats")
+def proxy_stats(db: Session = Depends(get_db)):
+    return proxy_pool.ProxyPool.get_stats(db)
+
+@app.get("/accounts/{account_id}/proxy")
+def get_account_proxy(account_id: int, db: Session = Depends(get_db)):
+    proxy = proxy_pool.ProxyPool.get_for_account(db, account_id)
+    if not proxy:
+        return {"assigned": False, "proxy": None}
+    return {"assigned": True, "proxy": {
+        "id": proxy.id,
+        "url": proxy.short_url,
+        "country": proxy.country,
+        "city": proxy.city,
+        "protocol": proxy.protocol,
+        "is_online": proxy.is_online,
+    }}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# COOKIE IMPORT (desde extensión Chrome)
+# ══════════════════════════════════════════════════════════════════════
+
+class CookieImportRequest(BaseModel):
+    """Formato: JSON con el array de cookies que exporta la extensión Chrome."""
+    cookies: list[dict] = Field(..., description="Array de cookies en formato extensión Chrome")
+    name: Optional[str] = Field(None, description="Nombre amigable para la cuenta")
+    proxy_url: Optional[str] = Field(None, description="Proxy opcional (http://user:pass@host:port)")
+
+class CookieImportResponse(BaseModel):
+    status: str
+    account_id: Optional[int] = None
+    name: Optional[str] = None
+    detail: Optional[str] = None
+
+class CookieValidateRequest(BaseModel):
+    cookies: list[dict] = Field(..., description="Array de cookies en formato extensión Chrome")
+
+class CookieValidateResponse(BaseModel):
+    valid: bool
+    name: Optional[str] = None
+    profile_pic: Optional[str] = None
+    error: Optional[str] = None
+    detected_country: Optional[str] = None
+
+
+@app.post("/accounts/cookies/validate", response_model=CookieValidateResponse)
+async def validate_cookies(payload: CookieValidateRequest):
+    """Valida cookies sin guardar nada. Responde si la sesión es válida y opcionalmente el nombre."""
+    try:
+        storage_state = cookie_importer.convert_to_storage_state(payload.cookies)
+        result = cookie_importer.validate_storage_state(storage_state)
+        result["detected_country"] = cookie_importer.detect_country_from_cookies(payload.cookies)
+        return CookieValidateResponse(**result)
+    except Exception as e:
+        logger.error(f"Error validating cookies: {e}")
+        return CookieValidateResponse(valid=False, error=f"Error interno: {str(e)[:100]}")
+
+
+@app.post("/accounts/cookies", response_model=CookieImportResponse)
+async def import_cookies(payload: CookieImportRequest, db: Session = Depends(get_db)):
+    """Importa cookies desde extensión Chrome, las valida y crea la cuenta."""
+    # 1. Convertir formato extensión → Playwright storage_state
+    storage_state = cookie_importer.convert_to_storage_state(payload.cookies)
+
+    if not storage_state.get("cookies"):
+        raise HTTPException(status_code=400, detail="No se encontraron cookies válidas en el JSON")
+
+    # 2. Validar contra LinkedIn
+    validation = cookie_importer.validate_storage_state(storage_state)
+    if not validation["valid"]:
+        raise HTTPException(status_code=400, detail=validation.get("error", "Cookies inválidas o expiradas"))
+
+    # 3. Extraer email de las cookies (o usar un placeholder)
+    # Buscar en el storage_state la cookie li_at para identificar la cuenta
+    name = payload.name or validation.get("name") or "Cuenta desde Cookie"
+
+    # 4. Verificar si ya existe una cuenta con ese nombre
+    existing = db.query(models.Account).filter(models.Account.name == name).first()
+    if existing:
+        # Actualizar storage_state de la cuenta existente
+        existing.storage_state = storage_state
+        existing.status = "active"
+        db.commit()
+        return CookieImportResponse(status="success", account_id=existing.id, name=name,
+                                    detail="Cookies actualizadas para cuenta existente")
+
+    # 5. Crear nueva cuenta (email único para evitar conflictos)
+    email_slug = name.lower().replace(" ", ".").replace("@", "_")[:30]
+    unique_email = f"{email_slug}.{uuid.uuid4().hex[:8]}@cookie.import"
+    new_account = models.Account(
+        name=name,
+        email=unique_email,
+        storage_state=storage_state,
+        proxy_url=payload.proxy_url,
+        status="active",
+    )
+    db.add(new_account)
+    db.commit()
+    db.refresh(new_account)
+
+    # 6. Auto-asignar proxy del país detectado (si hay disponible)
+    detected_country = cookie_importer.detect_country_from_cookies(payload.cookies)
+    if detected_country and not payload.proxy_url:
+        assigned = proxy_pool.ProxyPool.auto_assign(db, new_account.id, detected_country)
+        if assigned:
+            logger.info(f"Proxy auto-asignado: {assigned.short_url} ({detected_country}) → Account {new_account.id}")
+
+    logger.info(f"Cuenta creada desde cookie: ID={new_account.id}, name={name}")
+    return CookieImportResponse(status="success", account_id=new_account.id, name=name,
+                                detail="Cuenta creada exitosamente desde cookies")
+
+
 @app.get("/missions/", response_model=List[Mission])
 def read_missions(db: Session = Depends(get_db)):
     return db.query(models.Mission).order_by(models.Mission.created_at.desc()).limit(10).all()
@@ -477,9 +917,9 @@ def read_root():
     return {"status": "LinkedIn Orchestrator Online"}
 
 
-# ─────────────────────────────────────────────────
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2501
 # BULK MISSION  (multi-account + human delays + AI rephrase)
-# ─────────────────────────────────────────────────
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2501
 
 import random
 import re as _re
@@ -491,25 +931,25 @@ def _rephrase_comment(original: str, account_index: int) -> str:
     Strategy: sentence-level shuffling + synonym map + emoji rotation.
     """
     synonyms = {
-        r"\bde acuerdo\b": ["totalmente de acuerdo", "de acuerdo contigo", "en la misma línea"],
-        r"\bgenial\b": ["excelente", "fantástico", "muy bueno"],
+        r"\bde acuerdo\b": ["totalmente de acuerdo", "de acuerdo contigo", "en la misma l\u00ednea"],
+        r"\bgenial\b": ["excelente", "fant\u00e1stico", "muy bueno"],
         r"\binteresante\b": ["fascinante", "muy valioso", "relevante"],
         r"\bclave\b": ["fundamental", "esencial", "determinante"],
         r"\bimportante\b": ["crucial", "significativo", "relevante"],
         r"\bgracias\b": ["muchas gracias", "muy agradecido", "agradezco"],
         r"\bcompartir\b": ["difundir", "publicar", "mostrar"],
-        r"\benfoque\b": ["perspectiva", "visión", "punto de vista"],
-        r"\bincreíble\b": ["sorprendente", "notable", "impresionante"],
-        r"\bfantástico\b": ["maravilloso", "excelente", "estupendo"],
+        r"\benfoque\b": ["perspectiva", "visi\u00f3n", "punto de vista"],
+        r"\bincre\u00edble\b": ["sorprendente", "notable", "impresionante"],
+        r"\bfant\u00e1stico\b": ["maravilloso", "excelente", "estupendo"],
         r"\bseguro\b": ["sin duda", "definitivamente", "con certeza"],
         r"\btrabajo\b": ["esfuerzo", "contenido", "aporte"],
     }
     openers = [
-        "", "Completamente de acuerdo. ", "Muy buen punto. ", "Excelente reflexión. ",
+        "", "Completamente de acuerdo. ", "Muy buen punto. ", "Excelente reflexi\u00f3n. ",
         "Gran aporte. ", "100% de acuerdo. ", "Interesante perspectiva. "
     ]
     closers = [
-        "", " 👏", " 🙌", " 💡", " 🔥", " ✅", "!", " 💯"
+        "", " \ud83d\udc4f", " \ud83d\ude4c", " \ud83d\udca1", " \ud83d\udd25", " \u2705", "!", " \ud83d\udcaf"
     ]
 
     rng = random.Random(account_index * 7919 + len(original))  # deterministic per account+text
@@ -525,7 +965,7 @@ def _rephrase_comment(original: str, account_index: int) -> str:
     
     # If the random generator picked empty strings for both AND no synonyms matched, force a change
     if opener == "" and closer == "" and result == original:
-        closer = rng.choice([" 👏", " 🙌", " 💡", " ✅"])
+        closer = rng.choice([" \ud83d\udc4f", " \ud83d\ude4c", " \ud83d\udca1", " \u2705"])
         
     result = opener + result.strip() + closer
 
@@ -533,11 +973,11 @@ def _rephrase_comment(original: str, account_index: int) -> str:
 
 
 class BulkMissionBase(BaseModel):
-    account_ids: List[int]         # IDs de las cuentas, vacío = todas las activas
+    account_ids: List[int]         # IDs de las cuentas, vac\u00edo = todas las activas
     tasks: List[dict]              # mismas tareas para todos
     comment_mode: str = "literal"  # "literal" | "ai"
-    delay_min: int = 30            # segundos mínimos entre cuentas
-    delay_max: int = 120           # segundos máximos entre cuentas
+    delay_min: int = 30            # segundos m\u00ednimos entre cuentas
+    delay_max: int = 120           # segundos m\u00e1ximos entre cuentas
 
 
 async def _run_bulk_with_delays(
@@ -588,7 +1028,7 @@ async def create_bulk_missions(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # Resolve accounts: if empty list → all active accounts
+    # Resolve accounts: if empty list \u2192 all active accounts
     if not payload.account_ids:
         accounts = db.query(models.Account).filter(
             models.Account.status == "active",
@@ -636,16 +1076,16 @@ async def create_bulk_missions(
         "delay_range": f"{payload.delay_min}-{payload.delay_max}s",
     }
 
-# ─────────────────────────────────────────────────
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2501
 # AUTOPILOT (Target Profiles & Scheduling)
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 
-import autopilot
+@app.get("/autopilot/status")
+def get_autopilot_status(db: Session = Depends(get_db)):
+    """Returns the real-time state of the autopilot scheduler."""
+    import autopilot as _ap
+    return _ap.get_scheduler_status(db_session=db)
 
-@app.on_event("startup")
-async def startup_event():
-    # Start the autopilot scheduler loop in the background
-    asyncio.create_task(autopilot.start_autopilot_scheduler())
 
 class TargetProfileCreate(BaseModel):
     linkedin_url: str
@@ -783,3 +1223,319 @@ def update_warmup_config(payload: WarmupConfigUpdate, db: Session = Depends(get_
     db.commit()
     return {"status": "success"}
 
+@app.post("/test/concurrent")
+async def test_concurrent(req: ConcurrentTestRequest, db: Session = Depends(get_db)):
+    accounts = db.query(models.Account).filter(models.Account.id.in_(req.account_ids)).all()
+    if len(accounts) != len(req.account_ids):
+        raise HTTPException(status_code=404, detail="One or more accounts not found")
+        
+    account_map = {acc.id: acc for acc in accounts}
+    test_run_id = str(uuid.uuid4())
+    
+    async def run_single_test(account_id):
+        import time
+        start_time = time.time()
+        try:
+            acc = account_map[account_id]
+            db_mission = models.Mission(account_id=account_id, tasks=[req.task_template], status="running", source="concurrent_test")
+            db.add(db_mission)
+            db.commit()
+            db.refresh(db_mission)
+            
+            if not acc.storage_state:
+                res_str = "failed: no session"
+            else:
+                runner = orchestrator.MissionRunner(acc.storage_state, acc.proxy_url, account_id=acc.id)
+                try:
+                    task_res = await runner.execute_mission([req.task_template])
+                    if task_res and len(task_res) > 0:
+                        res_str = str(task_res[0].get("result", "error"))
+                    else:
+                        res_str = "error: no result"
+                except Exception as e:
+                    res_str = f"error: {str(e)}"
+                    
+            duration = int((time.time() - start_time) * 1000)
+            
+            return {
+                "account_id": account_id,
+                "mission_id": db_mission.id,
+                "result": res_str,
+                "duration_ms": duration
+            }
+        except Exception as e:
+            return {
+                "account_id": account_id,
+                "mission_id": None,
+                "result": f"error: {str(e)}",
+                "duration_ms": int((time.time() - start_time) * 1000)
+            }
+            
+    import asyncio
+    coros = [run_single_test(aid) for aid in req.account_ids]
+    gathered_results = await asyncio.gather(*coros)
+    
+    for item in gathered_results:
+        ctr = models.ConcurrencyTestResult(
+            test_run_id=test_run_id,
+            account_id=item["account_id"],
+            account_email=account_map[item["account_id"]].email,
+            mission_id=item["mission_id"],
+            task_type=req.task_template.get("type", "unknown"),
+            result=item["result"],
+            duration_ms=item["duration_ms"]
+        )
+        db.add(ctr)
+    db.commit()
+    
+    return {
+        "test_run_id": test_run_id,
+        "results": gathered_results
+    }
+
+
+log_streamer = orchestrator.log_streamer
+
+@app.websocket("/ws/logs/{mission_id}")
+async def mission_log_stream(websocket: WebSocket, mission_id: int):
+    await websocket.accept()
+    queue = log_streamer.subscribe(mission_id)
+    try:
+        while True:
+            try:
+                log_entry = await asyncio.wait_for(queue.get(), timeout=30.0)
+                await websocket.send_json(log_entry)
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_json({"type": "heartbeat"})
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"WS /ws/logs/{mission_id} error: {e}")
+    finally:
+        log_streamer.unsubscribe(mission_id, queue)
+
+# --- WIZARD ENDPOINTS ---
+
+class WizardStart(BaseModel):
+    email: str
+    password: str
+    proxy_url: Optional[str] = None
+
+class WizardVerify(BaseModel):
+    session_id: int
+    code: str
+
+active_wizard_sessions = {}
+wizard_lock = threading.Lock()
+
+async def run_wizard_login(session_id: int):
+    # This runs in background
+    db = SessionLocal()
+    try:
+        pending = db.get(models.PendingLogin, session_id)
+        if not pending:
+            return
+
+        manager = orchestrator.GuidedLogin(pending.email, _simple_decrypt(pending.password_encrypted), pending.proxy_url)
+        with wizard_lock:
+            active_wizard_sessions[session_id] = {
+                "manager": manager,
+                "created_at": datetime.datetime.utcnow(),
+                "failed_attempts": 0
+            }
+            
+        status = await manager.start()
+        
+        # Parse status
+        if status == "success":
+            pending.status = "success"
+            # create account immediately
+            existing = db.query(models.Account).filter(models.Account.email == pending.email).first()
+            if existing:
+                existing.storage_state = manager.storage_state
+                existing.status = "active"
+            else:
+                new_acc = models.Account(
+                    name=pending.email.split('@')[0],
+                    email=pending.email,
+                    storage_state=manager.storage_state,
+                    proxy_url=pending.proxy_url,
+                    status="active"
+                )
+                db.add(new_acc)
+            with wizard_lock:
+                if session_id in active_wizard_sessions:
+                    del active_wizard_sessions[session_id]
+        elif status == "needs_captcha":
+            pending.status = "failed"
+            with wizard_lock:
+                if session_id in active_wizard_sessions:
+                    del active_wizard_sessions[session_id]
+        elif status.startswith("needs_2fa_email"):
+            pending.status = "2fa_email"
+            parts = status.split(":", 1)
+            if len(parts) > 1:
+                pending.code_sent_to = parts[1]
+        elif status == "needs_2fa_app":
+            pending.status = "2fa_app"
+        elif status == "needs_2fa_sms":
+            pending.status = "2fa_sms"
+        elif status == "2fa_required":
+            pending.status = "2fa_unknown"
+        else:
+            pending.status = "failed"
+            with wizard_lock:
+                if session_id in active_wizard_sessions:
+                    del active_wizard_sessions[session_id]
+                    
+        db.commit()
+    except Exception as e:
+        logger.error(f"Wizard error: {e}")
+        try:
+            pending = db.get(models.PendingLogin, session_id)
+            if pending:
+                pending.status = "failed"
+                db.commit()
+        except:
+            pass
+        with wizard_lock:
+            if session_id in active_wizard_sessions:
+                del active_wizard_sessions[session_id]
+    finally:
+        db.close()
+
+
+@app.post("/wizard/start")
+async def wizard_start(data: WizardStart, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    pending = models.PendingLogin(
+        email=data.email,
+        password_encrypted=_simple_encrypt(data.password),
+        proxy_url=data.proxy_url,
+        status="processing"
+    )
+    db.add(pending)
+    db.commit()
+    db.refresh(pending)
+    
+    background_tasks.add_task(run_wizard_login, pending.id)
+    return {"session_id": pending.id, "status": "processing"}
+
+@app.get("/wizard/status/{session_id}")
+def wizard_status(session_id: int, db: Session = Depends(get_db)):
+    pending = db.get(models.PendingLogin, session_id)
+    if not pending:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    return {
+        "session_id": pending.id,
+        "status": pending.status,
+        "two_fa_destination": pending.code_sent_to
+    }
+
+@app.post("/wizard/verify")
+async def wizard_verify(data: WizardVerify, db: Session = Depends(get_db)):
+    pending = db.get(models.PendingLogin, data.session_id)
+    if not pending:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    with wizard_lock:
+        if data.session_id not in active_wizard_sessions:
+            raise HTTPException(status_code=400, detail="Wizard session expired or invalid")
+        sess_data = active_wizard_sessions[data.session_id]
+        if sess_data["failed_attempts"] >= 5:
+            del active_wizard_sessions[data.session_id]
+            pending.status = "failed"
+            db.commit()
+            raise HTTPException(status_code=429, detail="Too many attempts")
+            
+        manager = sess_data["manager"]
+        
+    storage_state = await manager.submit_code(data.code)
+    
+    if storage_state:
+        existing = db.query(models.Account).filter(models.Account.email == pending.email).first()
+        if existing:
+            existing.storage_state = storage_state
+            existing.status = "active"
+            db.commit()
+            db.refresh(existing)
+            account_id = existing.id
+        else:
+            new_acc = models.Account(
+                name=pending.email.split('@')[0],
+                email=pending.email,
+                storage_state=storage_state,
+                proxy_url=pending.proxy_url,
+                status="active"
+            )
+            db.add(new_acc)
+            db.commit()
+            db.refresh(new_acc)
+            account_id = new_acc.id
+            
+        pending.status = "success"
+        db.commit()
+        
+        with wizard_lock:
+            if data.session_id in active_wizard_sessions:
+                del active_wizard_sessions[data.session_id]
+                
+        return {"status": "success", "account_id": account_id}
+    else:
+        with wizard_lock:
+            if data.session_id in active_wizard_sessions:
+                active_wizard_sessions[data.session_id]["failed_attempts"] += 1
+        return {"status": "failed", "detail": "Invalid code"}
+
+
+# ── WebSocket: Live Mission Logs ──────────────────────────────────────
+@app.websocket("/ws/logs/{mission_id}")
+async def ws_mission_logs(websocket: WebSocket, mission_id: int):
+    await websocket.accept()
+    last_log_id = 0
+    try:
+        while True:
+            db = SessionLocal()
+            try:
+                mission = db.query(models.Mission).filter(models.Mission.id == mission_id).first()
+                if not mission:
+                    await websocket.send_json({"type": "error", "level": "error", "message": f"Mission #{mission_id} not found"})
+                    break
+
+                # Fetch new logs since last check
+                new_logs = db.query(models.Log).filter(
+                    models.Log.mission_id == mission_id,
+                    models.Log.id > last_log_id
+                ).order_by(models.Log.id.asc()).all()
+
+                for log in new_logs:
+                    await websocket.send_json({
+                        "type": "log",
+                        "level": log.level or "info",
+                        "message": log.message,
+                        "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+                    })
+                    last_log_id = log.id
+
+                # If mission is done, send final status and close
+                if mission.status in ("completed", "failed"):
+                    await websocket.send_json({
+                        "type": "status",
+                        "level": "success" if mission.status == "completed" else "error",
+                        "message": f"Mission #{mission_id} {mission.status}.",
+                    })
+                    break
+
+                # Heartbeat
+                await websocket.send_json({"type": "heartbeat"})
+            finally:
+                db.close()
+
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass

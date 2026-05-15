@@ -6,9 +6,10 @@ interface AccountsViewProps {
   accounts: Account[];
   onOpenWizard: () => void;
   onDeleteAccount: (id: number) => Promise<void>;
+  onRefresh: () => void;
 }
 
-export function AccountsView({ accounts, onOpenWizard, onDeleteAccount }: AccountsViewProps) {
+export function AccountsView({ accounts, onOpenWizard, onDeleteAccount, onRefresh }: AccountsViewProps) {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<number | null>(null);
 
   const handleDelete = async (id: number) => {
@@ -23,13 +24,15 @@ export function AccountsView({ accounts, onOpenWizard, onDeleteAccount }: Accoun
           <div className="w-1.5 h-6 bg-indigo-500 rounded-full"></div>
           Linked Identities
         </h3>
-        <button 
-          onClick={onOpenWizard}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-400 text-sm font-medium hover:bg-indigo-500/20 transition-all shadow-[0_0_15px_rgba(99,102,241,0.1)]"
-        >
-          <Plus size={16} />
-          Vincular Nueva
-        </button>
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={onOpenWizard}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-400 text-sm font-medium hover:bg-indigo-500/20 transition-all shadow-[0_0_15px_rgba(99,102,241,0.1)]"
+          >
+            <Plus size={16} />
+            Vincular Nueva
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
